@@ -1,16 +1,20 @@
 // Package exporter provides a way to export data from opencensus to multiple GCP projects.
 //
 // General assumptions or requirements when using this exporter.
-// 1. Any view registered to opencensus corresponds to a stackdriver metric, that is already
-//    defined for all GCP projects.
-// 2. Any row in view data passed to StatsExporter has correcponding GCP projects, marked by either
-//    tag of the row, or default label in StatsExporter.
-// 3. After trimming labels, configuration of all view data matches that of corresponding
-//    stackdriver metric
+// 1. The basic unit of data is a view.Data with only a single view.Row. We define it as a separate
+//    type called RowData.
+// 2. We can inspect each RowData to tell whether this RowData is applicable for this exporter.
+// 3. For RowData that is applicable to this exporter, we require that
+// 3.1. Any view associated to RowData corresponds to a stackdriver metric, and it is already
+//      defined for all GCP projects.
+// 3.2. RowData has correcponding GCP projects, and we can determine its ID.
+// 3.3. After trimming labels and tags, configuration of all view data matches that of corresponding
+//      stackdriver metric
 package exporter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -29,6 +33,10 @@ var (
 	newMetricClient  = monitoring.NewMetricClient
 )
 
+// RowDataNonApplicableError is used to tell that given row data is not applicable to the exporter.
+// See GetProjectID of Options for more detail.
+var RowDataNonApplicableError = errors.New("row data is not applicable to the exporter, so it will be ignored")
+
 // StatsExporter is the exporter that can be registered to opencensus. A StatsExporter object must
 // be created by NewStatsExporter().
 type StatsExporter struct {
@@ -37,6 +45,7 @@ type StatsExporter struct {
 	opts   *Options
 
 	// copy of some option values which may be modified by exporter.
+	getProjectID   func(*RowData) (string, error)
 	onError        func(error, ...*RowData)
 	makeResource   func(map[string]string) (*monitoredrespb.MonitoredResource, error)
 	projectKeyName string
@@ -61,6 +70,12 @@ type Options struct {
 
 	// callback functions provided by user.
 
+	// GetProjectID is used to filter whether given row data can be applicable to this exporter
+	// and if so, it also determines the projectID of given row data. If
+	// RowDataNonApplicableError is returned, then the row data is not applicable to this
+	// exporter, and it will be silently ignored. Any other error is reported via OnError. When
+	// GetProjectID is not set, all row data will be considered non applicable to this exporter.
+	GetProjectID func(*RowData) (projectID string, err error)
 	// OnError is used to report any error happened while exporting view data fails. Whenever
 	// this function is called, it's guaranteed that at least one row data is also passed to
 	// OnError. Row data passed to OnError must not be modified. When OnError is not set, all
@@ -80,9 +95,6 @@ type Options struct {
 	// overlapping labels. In this case value in tag is used. Default labels are used for labels
 	// those are constant throughout exporte usage, like version number of the running program.
 	DefaultLabels map[string]string
-	// ProjectKeyName is the label name designating GCP project. If ProjectKeyName is not set,
-	// DefaultProjectKeyName is used.
-	ProjectKeyName string
 	// UnexportedLabels contains key of labels that will not be exported stackdriver. Typical
 	// uses of unexported labels will be either that marks project ID, or that's used only for
 	// constructing resource.
@@ -90,14 +102,15 @@ type Options struct {
 }
 
 // default values for options
-const (
-	DefaultProjectKeyName = "project_id"
-)
+func defaultGetProjectID(rd *RowData) (string, error) {
+	return "", RowDataNonApplicableError
+}
+
+func defaultOnError(err error, rds ...*RowData) {}
 
 func defaultMakeResource(labels map[string]string) (*monitoredrespb.MonitoredResource, error) {
 	return &monitoredrespb.MonitoredResource{Type: "global"}, nil
 }
-func defaultOnError(err error, rds ...*RowData) {}
 
 // NewStatsExporter creates a StatsExporter object. If opts is nil, default values are used. Once
 // call to NewStatsExporter is made, any fields in opts must not be modified at all. ctx will also
@@ -120,6 +133,11 @@ func NewStatsExporter(ctx context.Context, opts *Options) (*StatsExporter, error
 
 	// We don't want to modify user-supplied options, so save default options directly in
 	// exporter.
+	if opts.GetProjectID != nil {
+		e.getProjectID = opts.GetProjectID
+	} else {
+		e.getProjectID = defaultGetProjectID
+	}
 	if opts.OnError != nil {
 		e.onError = opts.OnError
 	} else {
@@ -130,18 +148,13 @@ func NewStatsExporter(ctx context.Context, opts *Options) (*StatsExporter, error
 	} else {
 		e.makeResource = defaultMakeResource
 	}
-	if opts.ProjectKeyName != "" {
-		e.projectKeyName = opts.ProjectKeyName
-	} else {
-		e.projectKeyName = DefaultProjectKeyName
-	}
 
 	return e, nil
 }
 
 // RowData represents a single row in view data. This is our unit of computation. We use a single
-// row instead of view data because a view data consists of multiple rows which can belong to
-// multiple projects.
+// row instead of view data because a view data consists of multiple rows, and each row may belong
+// to different projects.
 type RowData struct {
 	View       *view.View
 	Start, End time.Time
@@ -163,32 +176,24 @@ func (e *StatsExporter) ExportView(vd *view.Data) {
 
 // exportRowData exports a single row data.
 func (e *StatsExporter) exportRowData(rd *RowData) {
-	projName, ok := e.getProjName(rd.Row)
-	if !ok {
-		e.onError(fmt.Errorf("no project tag found on view %q", rd.View.Name), rd)
+	projID, err := e.getProjectID(rd)
+	if err != nil {
+		// We ignore non-applicable RowData.
+		if err != RowDataNonApplicableError {
+			newErr := fmt.Errorf("failed to get project ID on row data with view %q: %v", rd.View.Name, err)
+			e.onError(newErr, rd)
+		}
 		return
 	}
-	pd := e.getProjectData(projName)
+	pd := e.getProjectData(projID)
 	switch err := pd.bundler.Add(rd, 1); err {
 	case nil:
 	case bundler.ErrOversizedItem:
 		go pd.uploadRowData(rd)
 	default:
-		newErr := fmt.Errorf("adding view %q to bundle for project %q failed: %v", rd.View.Name, projName, err)
+		newErr := fmt.Errorf("failed to add row data with view %q to bundle for project %q: %v", rd.View.Name, projID, err)
 		e.onError(newErr, rd)
 	}
-}
-
-func (e *StatsExporter) getProjName(row *view.Row) (string, bool) {
-	projKey := e.projectKeyName
-	// Values in tags have higher precedence than those in default label, so inspect tags first.
-	for _, tag := range row.Tags {
-		if tag.Key.Name() == projKey {
-			return tag.Value, true
-		}
-	}
-	projName, ok := e.opts.DefaultLabels[projKey]
-	return projName, ok
 }
 
 func (e *StatsExporter) getProjectData(projectID string) *projectData {
@@ -214,7 +219,7 @@ func (e *StatsExporter) Close() error {
 	e.mu.Unlock()
 
 	if err := e.client.Close(); err != nil {
-		return fmt.Errorf("failed to closed metric client: %v", err)
+		return fmt.Errorf("failed to close the metric client: %v", err)
 	}
 	return nil
 }
