@@ -7,7 +7,7 @@
 // 3. For RowData that is applicable to this exporter, we require that
 // 3.1. Any view associated to RowData corresponds to a stackdriver metric, and it is already
 //      defined for all GCP projects.
-// 3.2. RowData has correcponding GCP projects, and we can determine its ID.
+// 3.2. RowData has correcponding GCP projects, and we can determine its project ID.
 // 3.3. After trimming labels and tags, configuration of all view data matches that of corresponding
 //      stackdriver metric
 package exporter
@@ -20,35 +20,25 @@ import (
 	"time"
 
 	monitoring "cloud.google.com/go/monitoring/apiv3"
+	gax "github.com/googleapis/gax-go"
 	"go.opencensus.io/stats/view"
 	"google.golang.org/api/option"
 	"google.golang.org/api/support/bundler"
 	monitoredrespb "google.golang.org/genproto/googleapis/api/monitoredres"
+	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
-
-// wrapper of functions and methods we use in monitoring API. Test may change these variables for
-// mocking purpose.
-var (
-	createTimeSeries = (*monitoring.MetricClient).CreateTimeSeries
-	newMetricClient  = monitoring.NewMetricClient
-)
-
-// RowDataNonApplicableError is used to tell that given row data is not applicable to the exporter.
-// See GetProjectID of Options for more detail.
-var RowDataNonApplicableError = errors.New("row data is not applicable to the exporter, so it will be ignored")
 
 // StatsExporter is the exporter that can be registered to opencensus. A StatsExporter object must
 // be created by NewStatsExporter().
 type StatsExporter struct {
 	ctx    context.Context
-	client *monitoring.MetricClient
+	client metricClient
 	opts   *Options
 
 	// copy of some option values which may be modified by exporter.
-	getProjectID   func(*RowData) (string, error)
-	onError        func(error, ...*RowData)
-	makeResource   func(map[string]string) (*monitoredrespb.MonitoredResource, error)
-	projectKeyName string
+	getProjectID func(*RowData) (string, error)
+	onError      func(error, ...*RowData)
+	makeResource func(*RowData) (*monitoredrespb.MonitoredResource, error)
 
 	// mu protects access to projDataMap
 	mu sync.Mutex
@@ -60,7 +50,7 @@ type StatsExporter struct {
 // are valid for use.
 type Options struct {
 	// ClientOptions designates options for creating metric client, especially credentials for
-	// RPC calls
+	// RPC calls.
 	ClientOptions []option.ClientOption
 
 	// options for bundles amortizing export requests. Note that a bundle is created for each
@@ -72,28 +62,31 @@ type Options struct {
 
 	// GetProjectID is used to filter whether given row data can be applicable to this exporter
 	// and if so, it also determines the projectID of given row data. If
-	// RowDataNonApplicableError is returned, then the row data is not applicable to this
-	// exporter, and it will be silently ignored. Any other error is reported via OnError. When
-	// GetProjectID is not set, all row data will be considered non applicable to this exporter.
+	// RowDataNotApplicableError is returned, then the row data is not applicable to this
+	// exporter, and it will be silently ignored. Though not recommended, other errors can be
+	// returned, and in that case the error is reported to callers via OnError and the row data
+	// will not be uploaded to stackdriver. When GetProjectID is not set, all row data will be
+	// considered not applicable to this exporter.
 	GetProjectID func(*RowData) (projectID string, err error)
 	// OnError is used to report any error happened while exporting view data fails. Whenever
 	// this function is called, it's guaranteed that at least one row data is also passed to
 	// OnError. Row data passed to OnError must not be modified. When OnError is not set, all
 	// errors happened on exporting are ignored.
 	OnError func(error, ...*RowData)
-	// MakeResource creates stackdriver resource from labels. Labels passed to this function is
-	// union of default labels and tags provided by view data, including exported labels. This
-	// function must not modify labels. Any error returned by this function will be considered
-	// error when exporting row data to stackdriver. When MakeResource is not set, global
-	// resource is used.
-	MakeResource func(labels map[string]string) (*monitoredrespb.MonitoredResource, error)
+	// MakeResource creates monitored resource from RowData. It is guaranteed that only RowData
+	// that passes GetProjectID will be given to this function. Though not recommended, error
+	// can be returned, and in that case the error is reported to callers via OnError and the
+	// row data will not be uploaded to stackdriver. When MakeResource is not set, global
+	// resource is used for all RowData objects.
+	MakeResource func(rd *RowData) (*monitoredrespb.MonitoredResource, error)
 
 	// options concerning labels.
 
 	// DefaultLabels store default value of some labels. Labels in DefaultLabels need not be
-	// specified in tags of view data. It's acceptable to have default labels and tags of view
-	// overlapping labels. In this case value in tag is used. Default labels are used for labels
-	// those are constant throughout exporte usage, like version number of the running program.
+	// specified in tags of view data. Default labels and tags of view may have overlapping
+	// label keys. In this case, values in tag are used. Default labels are used for labels
+	// those are constant throughout export operation, like version number of the calling
+	// program.
 	DefaultLabels map[string]string
 	// UnexportedLabels contains key of labels that will not be exported stackdriver. Typical
 	// uses of unexported labels will be either that marks project ID, or that's used only for
@@ -103,22 +96,19 @@ type Options struct {
 
 // default values for options
 func defaultGetProjectID(rd *RowData) (string, error) {
-	return "", RowDataNonApplicableError
+	return "", RowDataNotApplicableError
 }
 
 func defaultOnError(err error, rds ...*RowData) {}
 
-func defaultMakeResource(labels map[string]string) (*monitoredrespb.MonitoredResource, error) {
+func defaultMakeResource(rd *RowData) (*monitoredrespb.MonitoredResource, error) {
 	return &monitoredrespb.MonitoredResource{Type: "global"}, nil
 }
 
-// NewStatsExporter creates a StatsExporter object. If opts is nil, default values are used. Once
-// call to NewStatsExporter is made, any fields in opts must not be modified at all. ctx will also
-// be used throughout entire exporter operation when making RPC call.
+// NewStatsExporter creates a StatsExporter object. Once a call to NewStatsExporter is made, any
+// fields in opts must not be modified at all. ctx will also be used throughout entire exporter
+// operation when making RPC call.
 func NewStatsExporter(ctx context.Context, opts *Options) (*StatsExporter, error) {
-	if opts == nil {
-		opts = &Options{}
-	}
 	client, err := newMetricClient(ctx, opts.ClientOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a metric client: %v", err)
@@ -152,6 +142,18 @@ func NewStatsExporter(ctx context.Context, opts *Options) (*StatsExporter, error
 	return e, nil
 }
 
+// We wrap monitoring.MetricClient and it's maker for testing.
+type metricClient interface {
+	CreateTimeSeries(context.Context, *monitoringpb.CreateTimeSeriesRequest, ...gax.CallOption) error
+	Close() error
+}
+
+var newMetricClient = defaultNewMetricClient
+
+func defaultNewMetricClient(ctx context.Context, opts ...option.ClientOption) (metricClient, error) {
+	return monitoring.NewMetricClient(ctx, opts...)
+}
+
 // RowData represents a single row in view data. This is our unit of computation. We use a single
 // row instead of view data because a view data consists of multiple rows, and each row may belong
 // to different projects.
@@ -161,7 +163,8 @@ type RowData struct {
 	Row        *view.Row
 }
 
-// ExportView is the method called by opencensus to export view data.
+// ExportView is the method called by opencensus to export view data. It constructs RowData out of
+// view.Data objects.
 func (e *StatsExporter) ExportView(vd *view.Data) {
 	for _, row := range vd.Rows {
 		rd := &RowData{
@@ -174,24 +177,28 @@ func (e *StatsExporter) ExportView(vd *view.Data) {
 	}
 }
 
+// RowDataNotApplicableError is used to tell that given row data is not applicable to the exporter.
+// See GetProjectID of Options for more detail.
+var RowDataNotApplicableError = errors.New("row data is not applicable to the exporter, so it will be ignored")
+
 // exportRowData exports a single row data.
 func (e *StatsExporter) exportRowData(rd *RowData) {
 	projID, err := e.getProjectID(rd)
 	if err != nil {
 		// We ignore non-applicable RowData.
-		if err != RowDataNonApplicableError {
-			newErr := fmt.Errorf("failed to get project ID on row data with view %q: %v", rd.View.Name, err)
+		if err != RowDataNotApplicableError {
+			newErr := fmt.Errorf("failed to get project ID on row data with view %s: %v", rd.View.Name, err)
 			e.onError(newErr, rd)
 		}
 		return
 	}
 	pd := e.getProjectData(projID)
-	switch err := pd.bundler.Add(rd, 1); err {
+	switch err := pd.bndler.Add(rd, 1); err {
 	case nil:
 	case bundler.ErrOversizedItem:
 		go pd.uploadRowData(rd)
 	default:
-		newErr := fmt.Errorf("failed to add row data with view %q to bundle for project %q: %v", rd.View.Name, projID, err)
+		newErr := fmt.Errorf("failed to add row data with view %s to bundle for project %s: %v", rd.View.Name, projID, err)
 		e.onError(newErr, rd)
 	}
 }
@@ -210,11 +217,11 @@ func (e *StatsExporter) getProjectData(projectID string) *projectData {
 
 // Close flushes and closes the exporter. Close must be called after the exporter is unregistered
 // and no further calls to ExportView() are made. Once Close() is returned no further access to the
-// exporter is allowed in any form.
+// exporter is allowed in any way.
 func (e *StatsExporter) Close() error {
 	e.mu.Lock()
 	for _, pd := range e.projDataMap {
-		pd.bundler.Flush()
+		pd.bndler.Flush()
 	}
 	e.mu.Unlock()
 

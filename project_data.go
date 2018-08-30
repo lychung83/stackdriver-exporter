@@ -2,22 +2,48 @@ package exporter
 
 import (
 	"fmt"
+	"time"
 
+	"go.opencensus.io/tag"
 	"google.golang.org/api/support/bundler"
 	metricpb "google.golang.org/genproto/googleapis/api/metric"
 	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
 
-// maximum number of time series that stackdriver accepts.
-const MaxTimeSeriesPerUpload = 200
+// maximum number of time series that stackdriver accepts. Only test may change this value.
+var MaxTimeSeriesPerUpload = 200
 
-// projectData contain per-project data in exporter.
+// projectData contain per-project data in exporter. It should be created by newProjectData()
 type projectData struct {
 	parent    *StatsExporter
 	projectID string
 	// We make bundler for each project because call to monitoring RPC can be grouped only in
 	// project level
-	bundler *bundler.Bundler
+	bndler expBundler
+}
+
+// We wrap bundler and its maker for testing purpose.
+type expBundler interface {
+	Add(interface{}, int) error
+	Flush()
+}
+
+var newExpBundler = defaultNewExpBundler
+
+// Since options in bundler are directly set to its fields and interface does not allow any fields,
+// we put option set-up process inside bundler's maker.
+func defaultNewExpBundler(uploader func(interface{}), delayThreshold time.Duration, countThreshold int) expBundler {
+	bndler := bundler.NewBundler((*RowData)(nil), uploader)
+
+	// Set options for bundler if they are provided by users.
+	if 0 < delayThreshold {
+		bndler.DelayThreshold = delayThreshold
+	}
+	if 0 < countThreshold {
+		bndler.BundleCountThreshold = countThreshold
+	}
+
+	return bndler
 }
 
 func (e *StatsExporter) newProjectData(projectID string) *projectData {
@@ -26,34 +52,28 @@ func (e *StatsExporter) newProjectData(projectID string) *projectData {
 		projectID: projectID,
 	}
 
-	bundler := bundler.NewBundler((*RowData)(nil), pd.uploadRowData)
-
-	// Set options for bundler if they are provided by users.
-	opts := e.opts
-	if 0 < opts.BundleDelayThreshold {
-		bundler.DelayThreshold = opts.BundleDelayThreshold
-	}
-	if 0 < opts.BundleCountThreshold {
-		bundler.BundleCountThreshold = opts.BundleCountThreshold
-	}
-
-	pd.bundler = bundler
+	pd.bndler = newExpBundler(pd.uploadRowData, e.opts.BundleDelayThreshold, e.opts.BundleCountThreshold)
 	return pd
 }
 
 // uploadRowData is called by bundler to upload row data, and report any error happened meanwhile.
 func (pd *projectData) uploadRowData(bundle interface{}) {
 	exp := pd.parent
+	rds := bundle.([]*RowData)
 
+	// reqRds contains RowData objects those are uploaded to stackdriver at given iteration.
+	// It's main usage is for error reporting. For actual uploading operation, we use req.
+	// remainingRds are RowData that has not been processed at all.
 	var reqRds, remainingRds []*RowData
-	for rds := bundle.([]*RowData); len(rds) != 0; rds = remainingRds {
+	for ; len(rds) != 0; rds = remainingRds {
 		var req *monitoringpb.CreateTimeSeriesRequest
 		req, reqRds, remainingRds = pd.makeReq(rds)
 		if req == nil {
+			// no need to perform RPC call for empty set of requests.
 			continue
 		}
-		if err := createTimeSeries(exp.client, exp.ctx, req); err != nil {
-			newErr := fmt.Errorf("RPC call to create time series failed for project %q: %v", pd.projectID, err)
+		if err := exp.client.CreateTimeSeries(exp.ctx, req); err != nil {
+			newErr := fmt.Errorf("RPC call to create time series failed for project %s: %v", pd.projectID, err)
 			// We pass all row data not successfully uploaded.
 			exp.onError(newErr, reqRds...)
 		}
@@ -69,7 +89,7 @@ func (pd *projectData) uploadRowData(bundle interface{}) {
 // is nil, then there's nothing to request and reqRds will also contain nothing.
 //
 // Some rows in rds may fail while converting them to time series, and in that case makeReq() calls
-// exporter's onError() directly, not propagating errors to caller.
+// exporter's onError() directly, not propagating errors to the caller.
 func (pd *projectData) makeReq(rds []*RowData) (req *monitoringpb.CreateTimeSeriesRequest, reqRds, remainingRds []*RowData) {
 	exp := pd.parent
 	timeSeries := []*monitoringpb.TimeSeries{}
@@ -78,28 +98,22 @@ func (pd *projectData) makeReq(rds []*RowData) (req *monitoringpb.CreateTimeSeri
 	var rd *RowData
 	for i, rd = range rds {
 		pt := newPoint(rd.View, rd.Row, rd.Start, rd.End)
-		if pt == nil {
-			err := fmt.Errorf("view %q has inconsistency", rd.View.Name)
+		if pt.Value == nil {
+			err := fmt.Errorf("inconsistent data found in view %s", rd.View.Name)
 			pd.parent.onError(err, rd)
 			continue
 		}
-		// Construct resource out of all labels including unexported ones.
-		labels := exp.newRawLabels(rd.Row.Tags)
-		resource, userErr := exp.makeResource(labels)
-		if userErr != nil {
-			newErr := fmt.Errorf("failed to construct resource of view %q using user-provided MakeResource(): %v", rd.View.Name, userErr)
+		resource, err := exp.makeResource(rd)
+		if err != nil {
+			newErr := fmt.Errorf("failed to construct resource of view %s: %v", rd.View.Name, err)
 			pd.parent.onError(newErr, rd)
 			continue
 		}
 
-		// After resource is constructed, we only leave exported labels.
-		for _, key := range exp.opts.UnexportedLabels {
-			delete(labels, key)
-		}
 		ts := &monitoringpb.TimeSeries{
 			Metric: &metricpb.Metric{
 				Type:   rd.View.Name,
-				Labels: labels,
+				Labels: exp.makeLabels(rd.Row.Tags),
 			},
 			Resource: resource,
 			Points:   []*monitoringpb.Point{pt},
@@ -124,4 +138,22 @@ func (pd *projectData) makeReq(rds []*RowData) (req *monitoringpb.CreateTimeSeri
 		}
 	}
 	return req, reqRds, remainingRds
+}
+
+// makeLables constructs label that's ready for being uploaded to stackdriver.
+func (e *StatsExporter) makeLabels(tags []tag.Tag) map[string]string {
+	opts := e.opts
+	labels := make(map[string]string, len(opts.DefaultLabels)+len(tags))
+	for key, val := range opts.DefaultLabels {
+		labels[key] = val
+	}
+	// If there's overlap When combining exporter's default label and tags, values in tags win.
+	for _, tag := range tags {
+		labels[tag.Key.Name()] = tag.Value
+	}
+	// Some labels are not for exporting.
+	for _, key := range opts.UnexportedLabels {
+		delete(labels, key)
+	}
+	return labels
 }

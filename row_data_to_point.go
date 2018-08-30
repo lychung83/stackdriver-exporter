@@ -6,10 +6,13 @@ import (
 	timestamppb "github.com/golang/protobuf/ptypes/timestamp"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
-	"go.opencensus.io/tag"
 	distributionpb "google.golang.org/genproto/googleapis/api/distribution"
 	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
+
+// Functions in this file is used to convert RowData to monitoring point that are used by uploading
+// RPC calls of monitoring client. All functions in this file are copied from
+// contrib.go.opencensus.io/exporter/stackdriver.
 
 func newPoint(v *view.View, row *view.Row, start, end time.Time) *monitoringpb.Point {
 	switch v.Aggregation.Type {
@@ -100,18 +103,4 @@ func newTypedValue(vd *view.View, r *view.Row) *monitoringpb.TypedValue {
 		}
 	}
 	return nil
-}
-
-// newRawLables combines exporter's default label and tags. When there's any overlap, values in tags
-// win.
-func (e *StatsExporter) newRawLabels(tags []tag.Tag) map[string]string {
-	opts := e.opts
-	labels := make(map[string]string, len(opts.DefaultLabels)+len(tags))
-	for key, val := range opts.DefaultLabels {
-		labels[key] = val
-	}
-	for _, tag := range tags {
-		labels[tag.Key.Name()] = tag.Value
-	}
-	return labels
 }
